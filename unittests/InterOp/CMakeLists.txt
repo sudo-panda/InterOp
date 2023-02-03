@@ -16,9 +16,5 @@ set_source_files_properties(Utils.cpp
 
 target_link_libraries(InterOpTests
   PRIVATE
-  clingInterpreter
   clangInterOp
-  clangAST
-  clangBasic
-  clangLex
   )
