@@ -168,6 +168,8 @@ namespace InterOp {
   CallFuncWrapper_t GetFunctionCallWrapper(TInterp_t interp,
                                            TCppFunction_t func);
 
+  void AddTypeToLambda(TCppType_t type, const std::string &lambda_name);
+
   /// Checks if a function declared is of const type or not
   bool IsConstMethod(TCppFunction_t method);
 

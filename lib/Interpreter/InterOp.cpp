@@ -998,6 +998,7 @@ namespace InterOp {
       PrintingPolicy Policy((LangOptions()));
       Policy.Bool = true; // Print bool instead of _Bool.
       Policy.SuppressTagKeyword = true; // Do not print `class std::string`.
+      Policy.AnonymousTagLocations = false; // Do not print `lambda at input_line_12:1:18`.
       return compat::FixTypeName(QT.getAsString(Policy));
   }
 
@@ -1097,6 +1098,15 @@ namespace InterOp {
     static unsigned long long gWrapperSerial = 0LL;
     static const std::string kIndentString("   ");
     static std::map<const FunctionDecl*, void *> gWrapperStore;
+    static std::map<TCppType_t, std::string> gTypeToLambdaMap;
+
+    std::string get_lambda_name_from_type(TCppType_t type) {
+      auto type_and_lambda = gTypeToLambdaMap.find(type);
+      if (type_and_lambda == gTypeToLambdaMap.end()) {
+        return "";
+      }
+      return type_and_lambda->second;
+    }
 
     enum EReferenceType { kNotReference, kLValueReference, kRValueReference };
 
@@ -1130,6 +1140,7 @@ namespace InterOp {
       //
       ASTContext& C = FD->getASTContext();
       PrintingPolicy Policy(C.getPrintingPolicy());
+      Policy.AnonymousTagLocations = false;
       refType = kNotReference;
       if (QT->isRecordType() && forArgument) {
         get_type_as_string(QT, type_name, C, Policy);
@@ -1239,6 +1250,9 @@ namespace InterOp {
       callbuf << ")";
     }
 
+    static std::map<OverloadedOperatorKind, std::string> binOperatorKinds;
+    static std::map<OverloadedOperatorKind, std::string> unyOperatorKinds;
+
     void make_narg_call(const FunctionDecl* FD, const std::string& return_type,
                         const unsigned N, std::ostringstream& typedefbuf,
                         std::ostringstream& callbuf,
@@ -1248,6 +1262,59 @@ namespace InterOp {
       //
       // ((<class>*)obj)-><method>(*(<arg-i-type>*)args[i], ...)
       //
+
+      if (binOperatorKinds.empty()) {
+        // Prepare lookup map for specific binary operators that are supposed to
+        // be left in-place for Cling to resolve.
+        binOperatorKinds[OO_Plus] = " + ";
+        binOperatorKinds[OO_Minus] = " - ";
+        binOperatorKinds[OO_Star] = " * ";
+        binOperatorKinds[OO_Slash] = " / ";
+        binOperatorKinds[OO_Percent] = " % ";
+        binOperatorKinds[OO_Caret] = " ^ ";
+        binOperatorKinds[OO_Amp] = " & ";
+        binOperatorKinds[OO_Pipe] = " | ";
+        binOperatorKinds[OO_Less] = " < ";
+        binOperatorKinds[OO_Greater] = " > ";
+        binOperatorKinds[OO_LessLess] = " << ";
+        binOperatorKinds[OO_GreaterGreater] = " >> ";
+        binOperatorKinds[OO_LessLessEqual] = " <<= ";
+        binOperatorKinds[OO_GreaterGreaterEqual] = " >>= ";
+        binOperatorKinds[OO_EqualEqual] = " == ";
+        binOperatorKinds[OO_ExclaimEqual] = " != ";
+        binOperatorKinds[OO_LessEqual] = " <= ";
+        binOperatorKinds[OO_GreaterEqual] = " >= ";
+        binOperatorKinds[OO_AmpAmp] = " && ";
+        binOperatorKinds[OO_PipePipe] = " || ";
+      }
+
+      if (unyOperatorKinds.empty()) {
+        unyOperatorKinds[OO_Plus] = " + ";
+        unyOperatorKinds[OO_Minus] = " - ";
+        unyOperatorKinds[OO_Star] = " * ";
+        unyOperatorKinds[OO_Caret] = " ^ ";
+        unyOperatorKinds[OO_Exclaim] = " ! ";
+        unyOperatorKinds[OO_Amp] = " & ";
+        unyOperatorKinds[OO_Tilde] = " ~ ";
+      }
+
+      // Filter out binary operators and replace them simply by that operator
+      // to make Cling do the overload resolution. This is mainly for templates,
+      // some of which won't compile under Clang5, and others which do not have
+      // the proper specialization, even though the argument types match. (It's
+      // too late for silent SFINAE at this point.)
+      std::string optype = "";
+      if ((N == 1 || N == 2) && FD->getDeclName().getNameKind() == DeclarationName::CXXOperatorName) {
+        if (N == 2) {
+          auto res = binOperatorKinds.find(FD->getDeclName().getCXXOverloadedOperator());
+          if (res != binOperatorKinds.end())
+            optype = res->second;
+        } else {
+          auto res = unyOperatorKinds.find(FD->getDeclName().getCXXOverloadedOperator());
+          if (res != unyOperatorKinds.end())
+            optype = res->second;
+        }
+      }
 
       // Sometimes it's necessary that we cast the function we want to call
       // first to its explicit function type before calling it. This is supposed
@@ -1259,8 +1326,13 @@ namespace InterOp {
       // Same applies with member methods which seem to cause parse failures
       // even when we supply the object parameter. Therefore we only use it in
       // cases where we know it works and set this variable to true when we do.
-      bool ShouldCastFunction =
-          !isa<CXXMethodDecl>(FD) && N == FD->getNumParams();
+      bool ShouldCastFunction = optype.empty() &&
+                                !isa<CXXMethodDecl>(FD) && \
+                                N == FD->getNumParams() && \
+                                !FD->isTemplateInstantiation() && \
+                                return_type != "(lambda)" && \
+                                !FD->getReturnType()->isFunctionPointerType();
+
       if (ShouldCastFunction) {
         callbuf << "(";
         callbuf << "(";
@@ -1282,9 +1354,13 @@ namespace InterOp {
             const ParmVarDecl* PVD = FD->getParamDecl(i);
             QualType Ty = PVD->getType();
             QualType QT = Ty.getCanonicalType();
+            auto ET = llvm::dyn_cast<EnumType>(QT);
+            bool is_enum_tag = ET && !ET->getDecl()->isScoped() && !Ty.getTypePtr()->isTypedefNameType();
             std::string arg_type;
             ASTContext& C = FD->getASTContext();
             get_type_as_string(QT, arg_type, C, C.getPrintingPolicy());
+            if (is_enum_tag)
+              arg_type.insert(arg_type.rfind("const ", 0) == std::string::npos ? 0 : 6, "enum ");
             callbuf << arg_type;
           }
           if (FD->isVariadic())
@@ -1294,29 +1370,73 @@ namespace InterOp {
 
         callbuf << ")";
       }
-
-      if (const CXXMethodDecl* MD = dyn_cast<CXXMethodDecl>(FD)) {
-        // This is a class, struct, or union member.
-        if (MD->isConst())
-          callbuf << "((const " << class_name << "*)obj)->";
-        else
-          callbuf << "((" << class_name << "*)obj)->";
-      } else if (const NamedDecl* ND =
-                     dyn_cast<NamedDecl>(FD->getDeclContext())) {
-        // This is a namespace member.
-        (void)ND;
-        callbuf << class_name << "::";
-      }
-      //   callbuf << fMethod->Name() << "(";
+      
+      std::string function_name;
       {
-        std::string name;
-        {
-          llvm::raw_string_ostream stream(name);
-          FD->getNameForDiagnostic(stream,
-                                   FD->getASTContext().getPrintingPolicy(),
-                                   /*Qualified=*/false);
+        // for an extern "C" declared function in a namespace, the context is ExternC, not the
+        // namespace, so class_name will be empty, it is therefore added by printing the qualified
+        // name; in all other cases class_name is added later
+        llvm::raw_string_ostream stream(function_name);
+        FD->getNameForDiagnostic(stream, FD->getASTContext().getPrintingPolicy(),
+                                 /*Qualified=*/(FD->isInExternCContext() && class_name.empty()) ? true : false);
+      }
+
+      // If a template has consecutive parameter packs, then it is impossible to use the
+      // explicit name in the wrapper, since the type deduction is what determines the split
+      // of the packs. Instead, we'll revert to the non-templated function name and hope that
+      // the type casts in the wrapper will suffice.
+      if (FD->isTemplateInstantiation() && FD->getPrimaryTemplate()) {
+        const FunctionTemplateDecl *FTDecl = llvm::dyn_cast<FunctionTemplateDecl>(FD->getPrimaryTemplate());
+        if (FTDecl) {
+          auto templateParms = FTDecl->getTemplateParameters();
+          int numPacks = 0;
+          for (int iParam = 0, nParams = templateParms->size(); iParam < nParams; ++iParam) {
+            if (templateParms->getParam(iParam)->isTemplateParameterPack())
+              numPacks += 1;
+            else
+              numPacks = 0;
+          }
+
+          if (1 < numPacks) {
+            function_name.clear();
+            llvm::raw_string_ostream stream(function_name);
+            FTDecl->getNameForDiagnostic(stream, FTDecl->getASTContext().getPrintingPolicy(), /*Qualified=*/false);
+          }
         }
-        callbuf << name;
+      }
+
+#ifdef _WIN32
+      // TODO: This is not a true solution, but make_unique is so far the only relevant
+      // case: on Windows, make_unique is a variadic template and Cling finds the expanded
+      // version which can not be used in-place, so drop the expansion here. To be fixed
+      // with an update of Cling's lookup helper for templated functions.
+      if (function_name.compare(0, 12, "make_unique<") == 0)
+        function_name = function_name.substr(0, function_name.find(',')) + '>';
+#endif
+
+      if (optype.empty() || N == 1) {
+        bool isMethod = false;
+        if (const CXXMethodDecl* MD = dyn_cast<CXXMethodDecl>(FD)) {
+          // This is a class, struct, or union member.
+          if (MD->isConst())
+            callbuf << "((const " << class_name << "*)obj)->";
+          else
+            callbuf << "((" << class_name << "*)obj)->";
+          isMethod = true;
+        } else if (const NamedDecl* ND =
+                           dyn_cast<NamedDecl>(FD->getDeclContext())) {
+          // This is a namespace member.
+          (void) ND;
+          callbuf << class_name << "::";
+        }
+        //   callbuf << fMethod->Name() << "(";
+        {
+          if (optype.empty()) {
+            if (isMethod) callbuf << class_name << "::";
+            callbuf << function_name;
+          } else
+            callbuf << "operator" + optype;
+        }
       }
       if (ShouldCastFunction)
         callbuf << ")";
@@ -1326,21 +1446,34 @@ namespace InterOp {
         const ParmVarDecl* PVD = FD->getParamDecl(i);
         QualType Ty = PVD->getType();
         QualType QT = Ty.getCanonicalType();
+        // Break if QT is not publicly accessible; that would fail to compile anyway and typically
+        // such types would have a default value. Unfortunately this may cause silent problems.
+        CXXRecordDecl* rtdecl = QT->getAsCXXRecordDecl();
+        if (rtdecl && (rtdecl->getAccess() == AS_private || rtdecl->getAccess() == AS_protected))
+          break;
+        auto ET = llvm::dyn_cast<EnumType>(QT);
+        bool is_enum_tag = ET && !ET->getDecl()->isScoped() && !Ty.getTypePtr()->isTypedefNameType();
         std::string type_name;
         EReferenceType refType = kNotReference;
         bool isPointer = false;
         collect_type_info(FD, QT, typedefbuf, callbuf, type_name, refType,
                           isPointer, indent_level, true);
+        if (is_enum_tag)
+          type_name.insert(type_name.rfind("const ", 0) == std::string::npos ? 0 : 6, "enum ");
 
         if (i) {
-          callbuf << ',';
-          if (i % 2) {
-            callbuf << ' ';
-          } else {
-            callbuf << "\n";
-            for (int j = 0; j <= indent_level; ++j) {
-              callbuf << kIndentString;
+          if (optype.empty()) {
+            callbuf << ',';
+            if (i % 2) {
+              callbuf << ' ';
+            } else {
+              callbuf << "\n";
+              for (int j = 0; j <= indent_level; ++j) {
+                callbuf << kIndentString;
+              }
             }
+          } else {
+            callbuf << optype;
           }
         }
 
@@ -1351,9 +1484,23 @@ namespace InterOp {
         } else if (isPointer) {
           callbuf << "*(" << type_name.c_str() << "**)args[" << i << "]";
         } else {
-          // pointer falls back to non-pointer case; the argument preserves
-          // the "pointerness" (i.e. doesn't reference the value).
-          callbuf << "*(" << type_name.c_str() << "*)args[" << i << "]";
+          // By-value construction; this may either copy or move, but there is no
+          // information here in terms of intent. Thus, simply assume that the intent
+          // is to move if there is no viable copy constructor (ie. if the code would
+          // otherwise fail to even compile).
+
+          // Note: function pointers arguments are by-value.
+
+          // There does not appear to be a simple way of determining whether a viable
+          // copy constructor exists, so check for the most common case: the trivial
+          // one, but not uniquely available, while there is a move constructor.
+          if (rtdecl && (rtdecl->hasTrivialCopyConstructor() && !rtdecl->hasSimpleCopyConstructor()) && rtdecl->hasMoveConstructor()) {
+            // move construction as needed for classes (note that this is implicit)
+            callbuf << "std::move(*(" << type_name.c_str() << "*)args[" << i << "])";
+          } else {
+            // otherwise, and for builtins, use copy construction of temporary*/
+            callbuf << "*(" << type_name.c_str() << "*)args[" << i << "]";
+          }
         }
       }
       callbuf << ")";
@@ -1463,7 +1610,11 @@ namespace InterOp {
         make_narg_ctor_with_return(FD, N, class_name, buf, indent_level);
         return;
       }
-      QualType QT = FD->getReturnType().getCanonicalType();
+      QualType QT = FD->getReturnType();
+      CXXRecordDecl *rtdecl = QT->getAsCXXRecordDecl();
+      if (!rtdecl || (rtdecl->getAccess() != AS_private && rtdecl->getAccess() != AS_protected))
+        QT = QT.getCanonicalType();
+
       if (QT->isVoidType()) {
         std::ostringstream typedefbuf;
         std::ostringstream callbuf;
@@ -1498,21 +1649,28 @@ namespace InterOp {
           for (int i = 0; i < indent_level; ++i) {
             callbuf << kIndentString;
           }
-          callbuf << "new (ret) ";
           collect_type_info(FD, QT, typedefbuf, callbuf, type_name, refType,
                             isPointer, indent_level, false);
-          //
-          //  Write the type part of the placement new.
-          //
-          callbuf << "(" << type_name.c_str();
-          if (refType != kNotReference) {
-            callbuf << "*) (&";
-            type_name += "&";
-          } else if (isPointer) {
-            callbuf << "*) (";
-            type_name += "*";
+
+          bool IsNotLambda = type_name != "(lambda)";
+          if (IsNotLambda) {
+            callbuf << "new (ret) ";
+            //
+            //  Write the type part of the placement new.
+            //
+            callbuf << "(" << type_name.c_str();
+            if (refType != kNotReference) {
+              callbuf << "*) (&";
+              type_name += "&";
+            } else if (isPointer) {
+              callbuf << "*) (";
+              type_name += "*";
+            } else {
+              callbuf << ") (";
+            }
           } else {
-            callbuf << ") (";
+            // no cast for lambda's (return type wrapped later)
+            callbuf << "auto lll = (";
           }
           //
           //  Write the actual function call.
@@ -1523,6 +1681,12 @@ namespace InterOp {
           //  End the placement new.
           //
           callbuf << ");\n";
+          if (!IsNotLambda) {
+            for (int i = 0; i < indent_level; ++i) {
+              callbuf << kIndentString;
+            }
+            callbuf << "new (ret) __cling_internal::FT<decltype(lll)>::F{lll};\n";
+          }
           for (int i = 0; i < indent_level; ++i) {
             callbuf << kIndentString;
           }
@@ -1579,7 +1743,12 @@ namespace InterOp {
       if (const TypeDecl* TD = dyn_cast<TypeDecl>(DC)) {
         // This is a class, struct, or union member.
         QualType QT(TD->getTypeForDecl(), 0);
+        Policy.AnonymousTagLocations = false;
         get_type_as_string(QT, class_name, Context, Policy);
+        if (class_name == "(lambda)") {
+          const std::string &lambda_name = get_lambda_name_from_type(QT.getAsOpaquePtr());
+          class_name = "decltype(" + lambda_name + ")";
+        }
       } else if (const NamedDecl* ND = dyn_cast<NamedDecl>(DC)) {
         // This is a namespace member.
         raw_string_ostream stream(class_name);
@@ -2012,6 +2181,7 @@ namespace InterOp {
       //   Compile the wrapper code.
       //
       void *wrapper = compile_wrapper(I, wrapper_name, wrapper_code);
+      printf("%s\n", wrapper_code.c_str());
       if (wrapper) {
         gWrapperStore.insert(std::make_pair(FD, wrapper));
       } else {
@@ -2044,6 +2214,10 @@ namespace InterOp {
     }
 
     return 0;
+  }
+
+  void AddTypeToLambda(TCppType_t type, const std::string &lambda_name) {
+    gTypeToLambdaMap[type] = lambda_name;
   }
 
   namespace {

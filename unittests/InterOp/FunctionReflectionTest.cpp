@@ -561,39 +561,60 @@ TEST(FunctionReflectionTest, IsVirtualMethod) {
 }
 
 TEST(FunctionReflectionTest, GetFunctionCallWrapper) {
-  std::vector<Decl*> Decls;
-  std::string code = R"(
-    int f1(int i) { return i * i; }
-    )";
-
-  GetAllTopLevelDecls(code, Decls);
-
-  Interp->process(R"(
-    #include <string>
-    void f2(std::string &s) { printf("%s", s.c_str()); };
-  )");
-
+  Interp.reset(static_cast<compat::Interpreter*>(InterOp::CreateInterpreter()));
   Sema *S = &Interp->getCI()->getSema();
 
-  InterOp::CallFuncWrapper_t wrapper0 =
-      InterOp::GetFunctionCallWrapper((InterOp::TInterp_t) Interp.get(),
-                                      Decls[0]);
-  InterOp::CallFuncWrapper_t wrapper1 =
-      InterOp::GetFunctionCallWrapper((InterOp::TInterp_t) Interp.get(),
-                                      InterOp::GetNamed(S, "f2"));
-  int i = 9, ret;
-  std::string s("Hello World!\n");
-  void *args0[1] = { (void *) &i };
-  void *args1[1] = { (void *) &s };
+  {
+    Interp->process(R"(
+        int f1(int i) { return i * i; }
+      )");
 
-  wrapper0(0, 1, args0, &ret);
+    InterOp::CallFuncWrapper_t wrapper =
+            InterOp::GetFunctionCallWrapper((InterOp::TInterp_t) Interp.get(),
+                                            InterOp::GetNamed(S, "f1"));
+    int i = 9, ret;
+    void *args[1] = { (void *) &i };
+    wrapper(0, 1, args, &ret);
+    EXPECT_EQ(ret, i * i);
+  }
 
-  testing::internal::CaptureStdout();
-  wrapper1(0, 1, args1, 0);
-  std::string output = testing::internal::GetCapturedStdout();
+  {
+    Interp->process(R"(
+        #include <string>
+        void f2(std::string &s) { printf("%s", s.c_str()); };
+      )");
 
-  EXPECT_EQ(ret, i * i);
-  EXPECT_EQ(output, s);
+    InterOp::CallFuncWrapper_t wrapper =
+            InterOp::GetFunctionCallWrapper((InterOp::TInterp_t) Interp.get(),
+                                            InterOp::GetNamed(S, "f2"));
+    std::string s("Hello World!\n");
+    void *args[1] = { (void *) &s };
+    testing::internal::CaptureStdout();
+    wrapper(0, 1, args, 0);
+    std::string output = testing::internal::GetCapturedStdout();
+
+    EXPECT_EQ(output, s);
+  }
+  {
+    Interp->process(R"(
+        auto lambda1 = [](int a) { return a; };
+      )");
+    
+    QualType LambdaQT = clang::QualType::getFromOpaquePtr(
+            InterOp::GetVariableType(InterOp::GetNamed(S, "lambda1")));
+    FunctionDecl* FD = LambdaQT->getAsCXXRecordDecl()->getLambdaCallOperator();
+
+    InterOp::AddTypeToLambda(LambdaQT.getCanonicalType().getAsOpaquePtr(), "lambda1");
+
+
+    InterOp::CallFuncWrapper_t wrapper =
+            InterOp::GetFunctionCallWrapper((InterOp::TInterp_t) Interp.get(),
+                                            FD);
+    int i = 9, ret;
+    void *args[1] = {(void *) &i};
+    wrapper(0, 1, args, &ret);
+    EXPECT_EQ(ret, i);
+  }
 }
 
 TEST(FunctionReflectionTest, IsConstMethod) {
