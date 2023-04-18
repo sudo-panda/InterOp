@@ -654,7 +654,8 @@ namespace InterOp {
   }
 
   void get_function_params(std::stringstream &ss, FunctionDecl *FD,
-          bool show_formal_args = false, TCppIndex_t max_args = -1)
+          const PrintingPolicy &Policy, bool show_formal_args = false,
+          TCppIndex_t max_args = -1)
   {
     ss << "(";
     if (max_args == (size_t) -1) max_args = FD->param_size();
@@ -665,14 +666,13 @@ namespace InterOp {
               PI != end; PI++) {
       if (i >= max_args)
           break;
-      ss << compat::FixTypeName((*PI)->getType().getAsString());
+      ss << compat::FixTypeName((*PI)->getType().getAsString(Policy));
       if (show_formal_args) {
         ss << " " << (*PI)->getNameAsString();
         if ((*PI)->hasDefaultArg()) {
           ss << " = ";
           raw_os_ostream def_arg_os(ss);
-          (*PI)->getDefaultArg()->printPretty(def_arg_os, nullptr,
-                  PrintingPolicy(Ctxt.getLangOpts()));
+          (*PI)->getDefaultArg()->printPretty(def_arg_os, nullptr, Policy);
         }
       }
       if (++i < max_args) {
@@ -706,13 +706,18 @@ namespace InterOp {
   std::string GetFunctionPrototype(TCppFunction_t func, bool show_formal_args)
   {
     auto *D = (clang::Decl *) func;
+    auto Policy = PrintingPolicy(D->getASTContext().getPrintingPolicy());
+    Policy.AnonymousTagLocations = false;
+    Policy.IncludeTagDefinition = false;
+    Policy.SuppressScope = true;
+    Policy.Bool = true;
     if (auto *FD = llvm::dyn_cast_or_null<FunctionDecl>(D)) {
       std::stringstream proto;
 
-      proto << compat::FixTypeName(FD->getReturnType().getAsString())
+      proto << compat::FixTypeName(FD->getReturnType().getAsString(Policy))
             << (FD->getReturnType()->isPointerType() ? "" : " ");
       proto << FD->getQualifiedNameAsString();
-      get_function_params(proto, FD, show_formal_args);
+      get_function_params(proto, FD, Policy, show_formal_args);
       return proto.str();
     }
     return "<unknown>";
